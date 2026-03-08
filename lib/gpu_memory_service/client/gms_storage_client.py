@@ -572,6 +572,32 @@ def _group_entries_by_shard(
     return dict(groups)
 
 
+def _plan_shard_layout(
+    allocations_info: List[Dict[str, Any]],
+    shard_size_bytes: int,
+) -> List[Tuple[int, int]]:
+    """Compute ``(shard_idx, byte_offset)`` for each allocation in order.
+
+    Mirrors the roll logic of :class:`_ShardWriter` so that parallel save
+    produces an identical on-disk layout to the serial writer.
+    """
+    result: List[Tuple[int, int]] = []
+    shard_idx = -1
+    current_offset = 0
+    started = False
+    for alloc in allocations_info:
+        size = int(alloc["aligned_size"])
+        if not started or (
+            current_offset > 0 and current_offset + size > shard_size_bytes
+        ):
+            shard_idx += 1
+            current_offset = 0
+            started = True
+        result.append((shard_idx, current_offset))
+        current_offset += size
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -653,13 +679,26 @@ class GMSStorageClient:
     # Public: dump
     # ------------------------------------------------------------------
 
-    def save(self) -> SaveManifest:
+    def save(self, max_workers: int = 4) -> SaveManifest:
         """Connect to GMS in RO mode and save all allocations + metadata to disk.
 
-        All allocation bytes are packed sequentially into shard files under
-        ``{output_dir}/shards/``.  Metadata is written to
+        Allocation bytes are packed into shard files under *shards_dir*
+        (default: ``{output_dir}/shards/``).  Metadata is written to
         ``{output_dir}/gms_metadata.json`` and a manifest to
         ``{output_dir}/manifest.json``.
+
+        Save is performed in two phases to maximise throughput:
+
+        * **Phase A (serial)**: import every GMS allocation VA via RPC.  The
+          RPC socket is not thread-safe so all imports run on the calling
+          thread, but they are fast (no data movement).
+        * **Phase B (parallel)**: write each shard file concurrently.  Each
+          worker thread reads its assigned allocations from GPU to CPU and
+          streams the bytes to its shard file, so D2H copies and disk writes
+          for different shards overlap in time.
+
+        Args:
+            max_workers: Thread pool size for parallel shard writes (default 4).
 
         Returns:
             :class:`SaveManifest` describing the saved state.
@@ -677,11 +716,12 @@ class GMSStorageClient:
             )
         if self.output_dir is None:
             raise ValueError(
-                "output_dir must be set to call dump(); pass it to GMSStorageClient()"
+                "output_dir must be set to call save(); pass it to GMSStorageClient()"
             )
 
         os.makedirs(self.output_dir, exist_ok=True)
         shards_dir = os.path.join(self.output_dir, "shards")
+        os.makedirs(shards_dir, exist_ok=True)
 
         with GMSClientMemoryManager(
             self._socket_path,
@@ -697,37 +737,67 @@ class GMSStorageClient:
             layout_hash = mm._client_rpc.get_memory_layout_hash()
             allocations_info = mm.list_allocations()
 
-            entries: List[AllocationEntry] = []
-            with _ShardWriter(shards_dir, self._shard_size) as writer:
-                for alloc in allocations_info:
-                    alloc_id = alloc["allocation_id"]
-                    size = int(alloc["size"])
-                    aligned_size = int(alloc["aligned_size"])
-                    tag = str(alloc.get("tag", "default"))
+            # Compute shard layout upfront (mirrors _ShardWriter roll logic).
+            layout = _plan_shard_layout(allocations_info, self._shard_size)
 
-                    va = mm.import_allocation(alloc_id)
-                    tensor = _tensor_from_pointer(
-                        va, [aligned_size], [1], torch.uint8, self.device
-                    )
+            # Phase A: import all VAs serially — the RPC socket is not
+            # thread-safe so concurrent calls would corrupt the stream.
+            va_list: List[int] = []
+            for alloc in allocations_info:
+                va_list.append(mm.import_allocation(alloc["allocation_id"]))
+            logger.info("Phase A complete: imported %d allocation VAs", len(va_list))
 
-                    rel_path, offset = writer.write(tensor)
-                    entries.append(
-                        AllocationEntry(
-                            allocation_id=alloc_id,
-                            size=size,
-                            aligned_size=aligned_size,
-                            tag=tag,
-                            tensor_file=rel_path,
-                            tensor_offset=offset,
+            # Group by shard: shard_idx → [(alloc_list_index, byte_offset)]
+            shard_groups: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
+            for i, (shard_idx, byte_offset) in enumerate(layout):
+                shard_groups[shard_idx].append((i, byte_offset))
+
+            entries: List[Optional[AllocationEntry]] = [None] * len(allocations_info)
+
+            def _write_shard(
+                shard_idx: int, alloc_pairs: List[Tuple[int, int]]
+            ) -> None:
+                filename = f"shard_{shard_idx:04d}.bin"  # noqa: E231
+                abs_path = os.path.join(shards_dir, filename)
+                tensor_file = os.path.join("shards", filename)
+                with open(abs_path, "wb") as f:
+                    for i, byte_offset in alloc_pairs:
+                        alloc = allocations_info[i]
+                        alloc_id = alloc["allocation_id"]
+                        aligned_size = int(alloc["aligned_size"])
+                        tensor = _tensor_from_pointer(
+                            va_list[i], [aligned_size], [1], torch.uint8, self.device
                         )
-                    )
-                    logger.info(
-                        "Dumped allocation %s (%d bytes) → %s@%d",
-                        alloc_id,
-                        aligned_size,
-                        rel_path,
-                        offset,
-                    )
+                        tensor.cpu().numpy().tofile(f)
+                        entries[i] = AllocationEntry(
+                            allocation_id=alloc_id,
+                            size=int(alloc["size"]),
+                            aligned_size=aligned_size,
+                            tag=str(alloc.get("tag", "default")),
+                            tensor_file=tensor_file,
+                            tensor_offset=byte_offset,
+                        )
+                        logger.info(
+                            "Dumped allocation %s (%d bytes) → %s@%d",
+                            alloc_id,
+                            aligned_size,
+                            tensor_file,
+                            byte_offset,
+                        )
+
+            # Phase B: write shards in parallel.
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                save_futures = {
+                    pool.submit(_write_shard, shard_idx, alloc_pairs): shard_idx
+                    for shard_idx, alloc_pairs in shard_groups.items()
+                }
+                for fut in as_completed(save_futures):
+                    fut.result()  # propagate any worker exceptions
+
+            logger.info("Phase B complete: wrote %d shards", len(shard_groups))
+
+            # entries list is fully populated — flatten to ordered list.
+            final_entries: List[AllocationEntry] = [e for e in entries if e is not None]
 
             metadata = self._save_metadata(mm)
 
@@ -745,14 +815,14 @@ class GMSStorageClient:
             device=self.device,
             use_gds=self._nixl_writer is not None,
             gds_available=gds_available,
-            allocations=entries,
+            allocations=final_entries,
         )
 
         manifest_path = os.path.join(self.output_dir, "manifest.json")
         with open(manifest_path, "w", encoding="utf-8") as f:
             json.dump(manifest.to_dict(), f, indent=2)
         logger.info(
-            "Wrote manifest to %s (%d allocations)", manifest_path, len(entries)
+            "Wrote manifest to %s (%d allocations)", manifest_path, len(final_entries)
         )
 
         return manifest
@@ -781,8 +851,8 @@ class GMSStorageClient:
         then filled in parallel using per-thread CUDA streams (Phase B).
 
         Args:
-            input_dir: Directory previously created by :meth:`dump`.
-            max_workers: Thread pool size for parallel shard reads.
+            input_dir: Directory previously created by :meth:`save`.
+            max_workers: Thread pool size for parallel shard reads/copies.
             clear_existing: If ``True`` (default) call ``clear_all()`` on the
                 server before restoring, so the result is an exact replica of
                 the dump.  Set to ``False`` to add allocations on top of any
@@ -1029,7 +1099,7 @@ class GMSStorageClient:
         reading its shard **front-to-back without seeking**.
 
         Args:
-            input_dir: Directory created by :meth:`dump`.
+            input_dir: Directory created by :meth:`save`.
             device: CUDA device index to restore tensors onto.
             max_workers: Thread pool size for parallel shard reads.
 

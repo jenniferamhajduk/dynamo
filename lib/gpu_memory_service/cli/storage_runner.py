@@ -64,7 +64,8 @@ def _run_save(args) -> None:
 
     logger.info(
         f"Saving GMS state: device={args.device}, socket={socket_path}, "
-        f"output_dir={args.output_dir}, gds={args.gds}"
+        f"output_dir={args.output_dir}, gds={args.gds}, "
+        f"save_workers={args.save_workers}"
     )
 
     client = GMSStorageClient(
@@ -76,7 +77,7 @@ def _run_save(args) -> None:
         shard_size_bytes=args.shard_size_bytes,
     )
 
-    manifest = client.save()
+    manifest = client.save(max_workers=args.save_workers)
 
     logger.info(
         f"Save complete: {len(manifest.allocations)} allocations written to "
@@ -177,9 +178,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             f"Soft upper bound per shard file in bytes "
             f"(default: {_SHARD_SIZE_DEFAULT // 1024**3} GiB).  "
-            "Decrease to increase parallelism on load; increase to "
+            "Decrease to increase parallelism on save/load; increase to "
             "reduce file count."
         ),
+    )
+    save_p.add_argument(
+        "--save-workers",
+        type=int,
+        default=4,
+        help="Thread pool size for parallel shard writes (default: 4).",
     )
     save_p.add_argument(
         "--verbose",
