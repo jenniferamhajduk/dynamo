@@ -273,6 +273,12 @@ pub mod llm {
     /// Enable the experimental Anthropic Messages API endpoint (/v1/messages)
     pub const DYN_ENABLE_ANTHROPIC_API: &str = "DYN_ENABLE_ANTHROPIC_API";
 
+    /// Enable streaming tool call dispatch (`event: tool_call_dispatch` SSE events)
+    pub const DYN_ENABLE_STREAMING_TOOL_DISPATCH: &str = "DYN_ENABLE_STREAMING_TOOL_DISPATCH";
+
+    /// Enable streaming reasoning dispatch (`event: reasoning_dispatch` SSE events)
+    pub const DYN_ENABLE_STREAMING_REASONING_DISPATCH: &str = "DYN_ENABLE_STREAMING_REASONING_DISPATCH";
+
     /// Metrics configuration
     pub mod metrics {
         /// Custom metrics prefix (overrides default "dynamo_frontend")
@@ -450,6 +456,8 @@ mod tests {
             llm::DYN_LORA_ENABLED,
             llm::DYN_LORA_PATH,
             llm::DYN_ENABLE_ANTHROPIC_API,
+            llm::DYN_ENABLE_STREAMING_TOOL_DISPATCH,
+            llm::DYN_ENABLE_STREAMING_REASONING_DISPATCH,
             llm::metrics::DYN_METRICS_PREFIX,
             // Model
             model::model_express::MODEL_EXPRESS_URL,
