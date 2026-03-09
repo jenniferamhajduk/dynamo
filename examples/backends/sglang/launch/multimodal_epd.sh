@@ -86,7 +86,7 @@ WORKER_EXTRA_ARGS=""
 
 if [[ "$SINGLE_GPU" == "true" ]]; then
     ENCODE_EXTRA_ARGS="--mem-fraction-static ${DYN_ENCODE_GPU_MEM}"
-    WORKER_EXTRA_ARGS="--mem-fraction-static ${DYN_WORKER_GPU_MEM} --enable-memory-saver --delete-ckpt-after-loading --max-running-requests 2 --chunked-prefill-size 4096 --max-prefill-tokens 4096"
+    WORKER_EXTRA_ARGS="--mem-fraction-static ${DYN_WORKER_GPU_MEM} --delete-ckpt-after-loading --max-running-requests 2 --chunked-prefill-size 4096 --max-prefill-tokens 4096"
 fi
 
 HTTP_PORT="${DYN_HTTP_PORT:-8000}"
