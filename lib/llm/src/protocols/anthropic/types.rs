@@ -379,6 +379,8 @@ pub struct AnthropicMessageResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum AnthropicResponseContentBlock {
+    #[serde(rename = "thinking")]
+    Thinking { thinking: String, signature: String },
     #[serde(rename = "text")]
     Text { text: String },
     #[serde(rename = "tool_use")]
@@ -449,10 +451,15 @@ pub enum AnthropicStreamEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum AnthropicDelta {
+    #[serde(rename = "thinking_delta")]
+    ThinkingDelta { thinking: String },
     #[serde(rename = "text_delta")]
     TextDelta { text: String },
     #[serde(rename = "input_json_delta")]
     InputJsonDelta { partial_json: String },
+    /// Sent as the final delta in a thinking content block (carries the signature).
+    #[serde(rename = "signature_delta")]
+    SignatureDelta { signature: String },
 }
 
 /// The delta body in a message_delta event.
@@ -833,6 +840,16 @@ pub fn chat_completion_to_anthropic_response(
                     id: tc.id,
                     name: tc.function.name,
                     input,
+                });
+            }
+        }
+
+        // Extract reasoning/thinking content (must come before text in Anthropic format)
+        if let Some(reasoning) = &choice.message.reasoning_content {
+            if !reasoning.is_empty() {
+                content.push(AnthropicResponseContentBlock::Thinking {
+                    thinking: reasoning.clone(),
+                    signature: "erased".to_string(),
                 });
             }
         }
