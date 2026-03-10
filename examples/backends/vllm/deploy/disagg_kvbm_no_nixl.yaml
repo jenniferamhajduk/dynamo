@@ -4,7 +4,7 @@
 apiVersion: nvidia.com/v1alpha1
 kind: DynamoGraphDeployment
 metadata:
-  name: vllm-agg-kvbm
+  name: vllm-disagg-kvbm-2p2d-no-nixl
 spec:
   services:
     Frontend:
@@ -16,7 +16,32 @@ spec:
     VllmDecodeWorker:
       envFromSecret: hf-token-secret
       componentType: worker
-      replicas: 1
+      replicas: 2
+      resources:
+        limits:
+          gpu: "1"
+      extraPodSpec:
+        mainContainer:
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.9.0
+          workingDir: /workspace/examples/backends/vllm
+          command:
+          - python3
+          - -m
+          - dynamo.vllm
+          args:
+            - --model
+            - Qwen/Qwen3-8B
+            - --disaggregation-mode
+            - decode
+            #- --kv-transfer-config
+            #- '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
+            - --max-model-len
+            - "32000"
+            - --enforce-eager
+    VllmPrefillWorker:
+      envFromSecret: hf-token-secret
+      componentType: worker
+      replicas: 2
       resources:
         requests:
           gpu: "1"
@@ -29,7 +54,7 @@ spec:
           value: "100"
       extraPodSpec:
         mainContainer:
-          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:my-tag
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.9.0
           workingDir: /workspace/examples/backends/vllm
           command:
           - python3
@@ -38,8 +63,9 @@ spec:
           args:
             - --model
             - Qwen/Qwen3-8B
+            - --disaggregation-mode
+            - prefill
             - --max-model-len
             - "32000"
             - --enforce-eager
-            - --kv-transfer-config
-            - '{"kv_connector":"DynamoConnector","kv_connector_module_path":"kvbm.vllm_integration.connector","kv_role":"kv_both"}'
+            # --kv-transfer-config
